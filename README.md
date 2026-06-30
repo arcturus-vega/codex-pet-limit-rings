@@ -15,10 +15,14 @@ The rings are designed to be glanceable:
 - The outer ring shows the short-window limit remaining.
 - The inner ring shows the weekly limit remaining.
 - Color moves from calm green/blue to amber and red as capacity gets low.
+- The menu bar icon is a tiny live usage meter using the same outer/inner ring model.
+- `Ring Style` lets you switch between `Segmented Pixel`, `Classic Glow`, and `CRT Glow`.
+- `Pixel Cloud` toggles the quiet outer-ring pixel aura across all styles.
+- `Orbiting Glints` toggles the small animated square highlights independently of the pixel cloud.
 - Hovering over the pet or rings shows the exact percentages at the current ring endpoints.
-- A small menu-bar icon lets you hide the rings, refresh data, or quit.
+- The menu also lets you hide the rings, refresh data, copy debug geometry, or quit.
 
-When the Codex pet is closed, the rings disappear. When the pet comes back, they come back too. On multi-display setups, the rings stay with the pet instead of jumping to whichever screen is focused.
+When the Codex pet is closed, the rings disappear. When the pet comes back, they come back too. On multi-display setups, the rings stay with the pet instead of jumping to whichever screen is focused. The overlay also tracks Codex's pet window level when it can, so ordinary app windows do not cover the rings, while Codex's own pet messages and controls stay readable.
 
 Because the rings are drawn in a separate transparent overlay, they do not need pet-specific sprites, masks, metadata, or configuration. Change pets in Codex and the rings follow the new one automatically.
 
@@ -28,7 +32,7 @@ The important design choice is the companion boundary. A menu item inside Codex 
 
 `codex-pet-limit-rings` stays outside the Codex app. It reads local Codex state, asks ChatGPT for live usage data using the local Codex/ChatGPT token, and renders its own transparent always-on-top window around the pet. The result is reversible, inspectable, and easy for another Codex agent to install or modify.
 
-Pet wakeups are handled by a lightweight filesystem watcher on Codex's local global-state file, with a slow fallback timer as a safety net. That lets the rings snap back when the pet is re-enabled without constantly polling for position changes.
+Pet wakeups are handled by a lightweight filesystem watcher on Codex's local global-state file, with a slow fallback timer as a safety net. That lets the rings snap back when the pet is re-enabled without constantly polling for position changes. Dragging the pet gets a live follow path so the rings stay visually attached while Codex persists the new pet position.
 
 ## Quick Start
 
@@ -38,7 +42,7 @@ Install the rings as a login item:
 tools/install-limit-rings.sh
 ```
 
-You should see a small rings icon in the macOS menu bar. Use that menu to toggle `Show Rings`, refresh the latest usage data, or quit.
+You should see a small rings icon in the macOS menu bar. Use that menu to toggle `Show Rings`, choose a ring style, enable or disable `Pixel Cloud` and `Orbiting Glints`, refresh the latest usage data, copy debug geometry, or quit.
 
 Then use any Codex pet normally. No pet setup step is required.
 
@@ -109,6 +113,14 @@ experiments/weather-pets/
 
 ## Development
 
+Run the standard validation pass:
+
+```bash
+tools/validate-limit-rings.sh
+```
+
+That script checks shell syntax, compiles the app, renders previews for every ring style, builds an app bundle under `tmp/`, and runs `git diff --check` when available.
+
 Build the app:
 
 ```bash
@@ -118,14 +130,10 @@ tools/build-limit-rings.sh
 Render a static preview PNG:
 
 ```bash
-swiftc tools/codex-pet-limit-rings.swift -o tmp/codex-pet-limit-rings -framework AppKit -lsqlite3
-tmp/codex-pet-limit-rings --preview tmp/limit-rings-preview.png --size 164
-```
-
-Validate the shell scripts:
-
-```bash
-bash -n tools/*.sh
+swiftc tools/codex-pet-limit-rings.swift -o tmp/codex-pet-limit-rings -framework AppKit -framework QuartzCore -lsqlite3
+tmp/codex-pet-limit-rings --preview tmp/limit-rings-segmented-pixel.png --size 164 --style segmented-pixel
+tmp/codex-pet-limit-rings --preview tmp/limit-rings-classic-glow.png --size 164 --style classic-glow
+tmp/codex-pet-limit-rings --preview tmp/limit-rings-crt-glow.png --size 164 --style crt-glow
 ```
 
 ## Experiments
