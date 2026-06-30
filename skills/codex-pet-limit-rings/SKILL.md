@@ -77,12 +77,12 @@ When changing behavior or visuals:
 3. Run:
 
 ```bash
-bash -n tools/*.sh
-swiftc tools/codex-pet-limit-rings.swift -o tmp/codex-pet-limit-rings -framework AppKit -lsqlite3
-tmp/codex-pet-limit-rings --preview tmp/limit-rings-preview.png --size 164
+tools/validate-limit-rings.sh
 ```
 
 4. Relaunch with `tools/run-limit-rings.sh` for development or `tools/install-limit-rings.sh` for the packaged login-item flow.
+
+`tools/validate-limit-rings.sh` is the preferred agent-safe check because it compiles the app, renders previews for every ring style, builds the app bundle, and runs `git diff --check`.
 
 ## Open-Source Hygiene
 
