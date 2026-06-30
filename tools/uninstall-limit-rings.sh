@@ -20,6 +20,9 @@ rm -f "$OLD_AGENT"
 rm -rf "$APP"
 rm -rf "$OLD_APP"
 defaults delete local.codex.pet-limit-rings CodexPetLimitRings.ringsVisible >/dev/null 2>&1 || true
+defaults delete local.codex.pet-limit-rings CodexPetLimitRings.ringStyle >/dev/null 2>&1 || true
+defaults delete local.codex.pet-limit-rings CodexPetLimitRings.pixelCloudEnabled >/dev/null 2>&1 || true
+defaults delete local.codex.pet-limit-rings CodexPetLimitRings.orbitGlintsEnabled >/dev/null 2>&1 || true
 defaults delete local.codex.limit-aura CodexLimitAura.ringsVisible >/dev/null 2>&1 || true
 
 echo "Codex Pet Limit Rings uninstalled"

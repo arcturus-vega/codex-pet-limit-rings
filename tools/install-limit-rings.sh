@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="${CODEX_PET_LIMIT_RINGS_APP:-$HOME/Applications/CodexPetLimitRings.app}"
@@ -12,6 +13,8 @@ OLD_AGENT="$AGENT_DIR/com.codex-pet.limit-aura.plist"
 GUI_TARGET="gui/$(id -u)"
 
 mkdir -p "$(dirname "$APP")" "$AGENT_DIR" "$HOME/Library/Logs"
+touch "$HOME/Library/Logs/CodexPetLimitRings.log" "$HOME/Library/Logs/CodexPetLimitRings.err.log"
+chmod 600 "$HOME/Library/Logs/CodexPetLimitRings.log" "$HOME/Library/Logs/CodexPetLimitRings.err.log"
 
 launchctl bootout "$GUI_TARGET" "$AGENT" >/dev/null 2>&1 || true
 launchctl bootout "$GUI_TARGET" "$OLD_AGENT" >/dev/null 2>&1 || true
@@ -38,6 +41,13 @@ cat > "$AGENT" <<PLIST
   </array>
   <key>RunAtLoad</key>
   <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
   <key>LimitLoadToSessionType</key>
   <string>Aqua</string>
   <key>StandardOutPath</key>
@@ -48,6 +58,7 @@ cat > "$AGENT" <<PLIST
 </plist>
 PLIST
 
+chmod 600 "$AGENT"
 launchctl bootstrap "$GUI_TARGET" "$AGENT"
 launchctl kickstart -k "$GUI_TARGET/com.codex-pet.limit-rings"
 

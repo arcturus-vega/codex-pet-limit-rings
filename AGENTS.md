@@ -17,10 +17,10 @@ This repository packages `codex-pet-limit-rings`: a native macOS companion app t
 For app changes, verify:
 
 ```bash
-bash -n tools/*.sh
-swiftc tools/codex-pet-limit-rings.swift -o tmp/codex-pet-limit-rings -framework AppKit -lsqlite3
-tmp/codex-pet-limit-rings --preview tmp/limit-rings-preview.png --size 164
+tools/validate-limit-rings.sh
 ```
+
+That script checks shell syntax, compiles the app source, renders previews for every ring style, builds the app bundle, and runs `git diff --check` when the checkout is a Git repository.
 
 For packaged installs, also run `tools/install-limit-rings.sh` and verify:
 
