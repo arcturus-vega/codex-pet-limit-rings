@@ -6,7 +6,7 @@ The experience is a small macOS companion app. It watches where the Codex pet is
 
 It works with whatever Codex pet you like. Built-in pet, custom pet, tiny dog, robot, weather daemon, or anything else: the app does not care. It only follows the pet window that Codex is already showing.
 
-![Codex Pet Limit Rings around a Codex pet](docs/assets/codex-pet-limit-rings-screenshot.png)
+![Segmented pixel Codex Pet Limit Rings around a custom Codex pet](docs/assets/codex-pet-limit-rings-arcturus-preview.png)
 
 ## What You See
 
