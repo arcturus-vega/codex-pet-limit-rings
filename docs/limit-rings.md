@@ -11,6 +11,7 @@ The rings are pet-agnostic. They work with any pet Codex displays because the ap
 - `Ring Style` switches between `Segmented Pixel`, `Classic Glow`, and `CRT Glow`, and the choice persists across relaunches.
 - `Pixel Cloud` toggles the outer-ring pixel aura for every ring style, and the choice persists across relaunches.
 - `Orbiting Glints` toggles the animated square glints independently of the pixel cloud, and the choice persists across relaunches.
+- `Glint Speed` switches between the original calm cadence and a usage-responsive cadence. Responsive glints track a smoothed rate of allowance consumption for their corresponding rings, ignore resets and refills, and retain a gentle idle speed.
 - `Refresh Now` rereads usage and pet-position state.
 - `Copy Debug Geometry` copies screen, pet, overlay, and panel frames for diagnosing positioning issues.
 - Hovering over the ring or pet shows exact remaining percentages at the arc endpoints.
@@ -34,11 +35,13 @@ The app reads live usage first, then local files as support or fallback:
 - `electron-avatar-overlay-open` in the same state file: whether the Codex pet is currently open.
 - `~/.codex/logs_2.sqlite`: fallback source using the newest `codex.rate_limits` event when the live usage call fails.
 
-The app watches `~/.codex/.codex-global-state.json` with a macOS file event source, so pet open/close and position writes trigger an immediate frame update. A slow frame timer remains as a fallback in case the file is replaced or an event is missed. Pet coordinates are resolved against the display recorded by Codex when available, which keeps display-local pet bounds from being treated as primary-display coordinates.
+The app watches `~/.codex/.codex-global-state.json` with a macOS file event source, so pet open/close and position writes trigger an immediate frame update. A slow frame timer remains as a fallback in case the file is replaced or an event is missed. Pet coordinates are resolved against the display recorded by Codex when available. When Codex reports `displayBounds`, that frame is used as the top-left coordinate origin for the target display, which keeps secondary-monitor offsets from being treated as display-local zero-based coordinates.
 
 No OpenAI API key is required. The menu summary says `Live` when the direct usage read succeeds and `Cached` when it is showing the local event-log fallback.
 
 Live usage checks use an ephemeral, cacheless URL session. The app reads the local ChatGPT token to make the request but does not persist HTTP cache data or write token values to its logs.
+
+Usage polling is adaptive: it checks every 10 seconds while Codex is frontmost or recent allowance consumption has been observed, every 45 seconds while idle, and every 20 seconds while waiting for initial data. Activating Codex or waking the display prompts an early refresh. Glint speed is calculated from smoothed percentage consumption rather than presented as a literal token counter, since the endpoint reports allowance snapshots rather than per-token events.
 
 ## Source Map
 
@@ -63,7 +66,9 @@ Keep future changes inside the narrowest matching area. A larger source split ca
 - Exact percentages are shown only on hover to keep the pet feeling ambient rather than dashboard-like.
 - Additional model-limit buckets may appear as small outer markers when available.
 - Small square orbit highlights are compositor-driven layer animations and can be toggled independently, so the rings can stay lively without forcing continuous AppKit redraws.
+- Usage-responsive glints adjust the playback rate of those existing Core Animation layers without adding a display timer. Speed changes preserve the current orbit phase, remain bounded, and are smoothed over time to avoid jumps when usage snapshots update in batches.
 - Subtle static pixel dither appears around glow styles, while optional live outer-ring dust uses a low-rate outline emitter with a lighter wander layer so the effect feels like a quiet pixel aura and remains lightweight.
+- Compositor-backed dust and orbit layers are re-armed after system wake or display changes, so a stale `CAEmitterLayer` can recover without asking the user to toggle the pixel cloud manually.
 
 ## Install Contract
 

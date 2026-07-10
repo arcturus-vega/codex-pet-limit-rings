@@ -74,7 +74,10 @@ struct LimitState {
     static let empty = LimitState(planType: nil, primary: nil, secondary: nil, additional: [], observedAt: Date(), source: "none")
 }
 
-private let limitStatePollInterval: TimeInterval = 20.0
+private let activeLimitStatePollInterval: TimeInterval = 10.0
+private let idleLimitStatePollInterval: TimeInterval = 45.0
+private let missingLimitStatePollInterval: TimeInterval = 20.0
+private let usageActivityHoldInterval: TimeInterval = 5.0 * 60.0
 private let petFrameFallbackPollInterval: TimeInterval = 2.0
 private let petFrameStateDebounceInterval: TimeInterval = 0.035
 private let dragFollowInterval: TimeInterval = 1.0 / 60.0
@@ -86,6 +89,7 @@ private let ringsVisibleDefaultsKey = "CodexPetLimitRings.ringsVisible"
 private let ringStyleDefaultsKey = "CodexPetLimitRings.ringStyle"
 private let pixelCloudEnabledDefaultsKey = "CodexPetLimitRings.pixelCloudEnabled"
 private let orbitGlintsEnabledDefaultsKey = "CodexPetLimitRings.orbitGlintsEnabled"
+private let orbitSpeedModeDefaultsKey = "CodexPetLimitRings.orbitSpeedMode"
 private let liveUsageURL = URL(string: "https://chatgpt.com/backend-api/wham/usage")!
 private let fallbackPanelLevel = NSWindow.Level.statusBar
 
@@ -269,6 +273,112 @@ enum RingStyle: String, CaseIterable {
         case .crtGlow:
             return 10.5
         }
+    }
+}
+
+enum OrbitSpeedMode: String, CaseIterable {
+    case calm
+    case usageResponsive = "usage-responsive"
+
+    var menuTitle: String {
+        switch self {
+        case .calm:
+            return "Calm"
+        case .usageResponsive:
+            return "Usage Responsive"
+        }
+    }
+}
+
+private struct UsagePaceTracker {
+    struct Result {
+        var primaryMultiplier: Float
+        var secondaryMultiplier: Float
+        var didConsume: Bool
+    }
+
+    private struct Sample {
+        var usedPercent: Double
+        var windowMinutes: Double?
+        var resetAt: TimeInterval?
+        var observedAt: Date
+    }
+
+    private struct BucketTracker {
+        private var previous: Sample?
+        private(set) var smoothedPace = 0.0
+
+        mutating func update(bucket: LimitBucket?, observedAt: Date) -> (multiplier: Float, didConsume: Bool) {
+            guard let bucket else {
+                return (Self.speedMultiplier(for: smoothedPace), false)
+            }
+
+            let sample = Sample(
+                usedPercent: bucket.usedPercent,
+                windowMinutes: bucket.windowMinutes,
+                resetAt: bucket.resetAt,
+                observedAt: observedAt
+            )
+            guard let previous else {
+                self.previous = sample
+                return (Self.speedMultiplier(for: smoothedPace), false)
+            }
+
+            let elapsed = observedAt.timeIntervalSince(previous.observedAt)
+            let resetChanged = !Self.close(previous.resetAt, sample.resetAt, tolerance: 1.0)
+            let windowChanged = !Self.close(previous.windowMinutes, sample.windowMinutes, tolerance: 0.5)
+            let allowanceIncreased = sample.usedPercent < previous.usedPercent - 0.01
+            guard elapsed >= 2.0, elapsed <= 180.0, !resetChanged, !windowChanged, !allowanceIncreased else {
+                self.previous = sample
+                smoothedPace = 0.0
+                return (Self.speedMultiplier(for: smoothedPace), false)
+            }
+
+            let consumed = max(sample.usedPercent - previous.usedPercent, 0.0)
+            let didConsume = consumed >= 0.01
+            let instantPace: Double
+            if let windowMinutes = sample.windowMinutes, windowMinutes > 0.0 {
+                let elapsedMinutes = elapsed / 60.0
+                instantPace = min(consumed * windowMinutes / (100.0 * elapsedMinutes), 6.0)
+            } else {
+                instantPace = 0.0
+            }
+
+            let smoothingWindow: TimeInterval = 90.0
+            let smoothingWeight = 1.0 - exp(-elapsed / smoothingWindow)
+            smoothedPace += (instantPace - smoothedPace) * smoothingWeight
+            self.previous = sample
+            return (Self.speedMultiplier(for: smoothedPace), didConsume)
+        }
+
+        private static func speedMultiplier(for pace: Double) -> Float {
+            let boundedPace = min(max(pace, 0.0), 3.0)
+            return Float(min(0.78 + 0.70 * sqrt(boundedPace), 2.0))
+        }
+
+        private static func close(_ lhs: Double?, _ rhs: Double?, tolerance: Double) -> Bool {
+            switch (lhs, rhs) {
+            case (.none, .none):
+                return true
+            case let (.some(lhs), .some(rhs)):
+                return abs(lhs - rhs) <= tolerance
+            default:
+                return false
+            }
+        }
+    }
+
+    private var primary = BucketTracker()
+    private var secondary = BucketTracker()
+
+    mutating func update(with state: LimitState) -> Result {
+        let primaryResult = primary.update(bucket: state.primary, observedAt: state.observedAt)
+        let secondaryResult = secondary.update(bucket: state.secondary, observedAt: state.observedAt)
+        return Result(
+            primaryMultiplier: primaryResult.multiplier,
+            secondaryMultiplier: secondaryResult.multiplier,
+            didConsume: primaryResult.didConsume || secondaryResult.didConsume
+        )
     }
 }
 
@@ -501,6 +611,7 @@ struct PetFramesTopLeft {
     var mascot: CGRect
     var overlay: CGRect
     var displayId: CGDirectDisplayID?
+    var displayBounds: CGRect?
     var usedLiveOverlay: Bool
 }
 
@@ -529,6 +640,7 @@ final class PetFrameReader {
         }
 
         let displayId = directDisplayId(bounds["displayId"])
+        let displayBounds = rect(bounds["displayBounds"])
         let persistedOverlay = CGRect(x: x, y: y, width: overlayWidth, height: overlayHeight)
         let liveOverlay = preferLiveOverlay ? liveCodexOverlayBounds(matching: liveReference ?? persistedOverlay, expectedSize: persistedOverlay.size) : nil
         let overlay = liveOverlay ?? persistedOverlay
@@ -537,6 +649,7 @@ final class PetFrameReader {
             mascot: mascot,
             overlay: overlay,
             displayId: liveOverlay == nil ? displayId : nil,
+            displayBounds: liveOverlay == nil ? displayBounds : nil,
             usedLiveOverlay: liveOverlay != nil
         )
     }
@@ -562,6 +675,17 @@ final class PetFrameReader {
             return CGFloat(value)
         }
         return nil
+    }
+
+    private func rect(_ value: Any?) -> CGRect? {
+        guard let value = value as? [String: Any],
+              let x = number(value["x"]),
+              let y = number(value["y"]),
+              let width = number(value["width"]),
+              let height = number(value["height"]) else {
+            return nil
+        }
+        return CGRect(x: x, y: y, width: width, height: height)
     }
 
     private func directDisplayId(_ value: Any?) -> CGDirectDisplayID? {
@@ -1264,6 +1388,8 @@ final class LimitRingView: NSView {
     private let outerDustAuraEmitter = CAEmitterLayer()
     private var lastOrbitBounds: CGRect = .null
     private var lastDustConfiguration: DustConfiguration?
+    private var outerOrbitPlaybackRate: Float = 1.0
+    private var innerOrbitPlaybackRate: Float = 1.0
     private static let dustPixelContents = LimitRingView.makeDustPixelContents()
 
     override var isOpaque: Bool { false }
@@ -1282,6 +1408,48 @@ final class LimitRingView: NSView {
         super.layout()
         updateOrbitPathsIfNeeded()
         updateDynamicDust()
+    }
+
+    func rearmCompositorEffects() {
+        resetLayerTiming(layer)
+        resetLayerTiming(orbitContainerLayer)
+        resetLayerTiming(outerOrbitLayer)
+        resetLayerTiming(innerOrbitLayer)
+        resetLayerTiming(dustContainerLayer)
+        resetLayerTiming(outerDustAuraEmitter)
+        lastOrbitBounds = .null
+        updateOrbitStyle()
+        updateOrbitPathsIfNeeded()
+        resetDynamicDust()
+        updateOrbitVisibility()
+        applyOrbitPlaybackRates(force: true)
+    }
+
+    func setOrbitSpeedMultipliers(primary: Float, secondary: Float) {
+        let nextOuter = min(max(primary, 0.5), 2.0)
+        let nextInner = min(max(secondary, 0.5), 2.0)
+        let outerChanged = abs(nextOuter - outerOrbitPlaybackRate) >= 0.015
+        let innerChanged = abs(nextInner - innerOrbitPlaybackRate) >= 0.015
+        guard outerChanged || innerChanged else { return }
+        outerOrbitPlaybackRate = nextOuter
+        innerOrbitPlaybackRate = nextInner
+        applyOrbitPlaybackRates(force: false)
+    }
+
+    var compositorDebugLines: [String] {
+        [
+            "dustContainerSpeed: \(dustContainerLayer.speed)",
+            "dustContainerOpacity: \(dustContainerLayer.opacity)",
+            "dustEmitterHidden: \(outerDustAuraEmitter.isHidden)",
+            "dustEmitterBirthRate: \(outerDustAuraEmitter.birthRate)",
+            "dustEmitterCellCount: \(outerDustAuraEmitter.emitterCells?.count ?? 0)",
+            "dustEmitterSpeed: \(outerDustAuraEmitter.speed)",
+            "dustConfigurationActive: \(lastDustConfiguration != nil)",
+            "orbitContainerSpeed: \(orbitContainerLayer.speed)",
+            "orbitContainerOpacity: \(orbitContainerLayer.opacity)",
+            "outerOrbitPlaybackRate: \(outerOrbitPlaybackRate)",
+            "innerOrbitPlaybackRate: \(innerOrbitPlaybackRate)"
+        ]
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -1401,6 +1569,22 @@ final class LimitRingView: NSView {
         dot.add(animation, forKey: "orbit")
     }
 
+    private func applyOrbitPlaybackRates(force: Bool) {
+        setPlaybackRate(outerOrbitPlaybackRate, on: outerOrbitLayer, force: force)
+        setPlaybackRate(innerOrbitPlaybackRate, on: innerOrbitLayer, force: force)
+    }
+
+    private func setPlaybackRate(_ rate: Float, on layer: CALayer, force: Bool) {
+        guard force || abs(layer.speed - rate) >= 0.015 else { return }
+        let mediaTime = CACurrentMediaTime()
+        let localTime = layer.convertTime(mediaTime, from: nil)
+        layer.speed = rate
+        layer.timeOffset = 0.0
+        layer.beginTime = 0.0
+        let scaledTime = layer.convertTime(mediaTime, from: nil)
+        layer.beginTime = (scaledTime - localTime) / CFTimeInterval(rate)
+    }
+
     private func updateOrbitStyle() {
         let outerColor = state.primary.map { limitRingColor(forRemaining: $0.remainingPercent, role: .primary) }
             ?? NSColor(calibratedWhite: 1.0, alpha: 0.78)
@@ -1494,7 +1678,7 @@ final class LimitRingView: NSView {
         dot.shadowRadius = shadowRadius
     }
 
-    private func updateDynamicDust() {
+    private func updateDynamicDust(force: Bool = false) {
         guard bounds.width > 0, bounds.height > 0 else {
             dustContainerLayer.opacity = 0.0
             stopDustEmitters()
@@ -1515,7 +1699,10 @@ final class LimitRingView: NSView {
         let color = limitRingColor(forRemaining: primary.remainingPercent, role: .primary)
         let colorBand = dustColorBand(for: primary.remainingPercent)
         let configuration = DustConfiguration(bounds: bounds, style: style, colorBand: colorBand)
-        guard configuration != lastDustConfiguration else { return }
+        let emitterNeedsConfiguration = outerDustAuraEmitter.isHidden ||
+            outerDustAuraEmitter.birthRate <= 0.0 ||
+            (outerDustAuraEmitter.emitterCells?.isEmpty ?? true)
+        guard force || configuration != lastDustConfiguration || emitterNeedsConfiguration else { return }
         lastDustConfiguration = configuration
 
         outerDustAuraEmitter.isHidden = false
@@ -1529,10 +1716,22 @@ final class LimitRingView: NSView {
         outerDustAuraEmitter.birthRate = 1.0
     }
 
-    private func stopDustEmitters() {
+    private func resetDynamicDust() {
         lastDustConfiguration = nil
         outerDustAuraEmitter.birthRate = 0.0
+        outerDustAuraEmitter.emitterCells = nil
         outerDustAuraEmitter.isHidden = true
+    }
+
+    private func stopDustEmitters() {
+        resetDynamicDust()
+    }
+
+    private func resetLayerTiming(_ layer: CALayer?) {
+        guard let layer else { return }
+        layer.speed = 1.0
+        layer.timeOffset = 0.0
+        layer.beginTime = 0.0
     }
 
     private enum DustCellRole {
@@ -1637,6 +1836,7 @@ final class LimitRingsApp: NSObject {
     private var showRingsItem: NSMenuItem?
     private var pixelCloudItem: NSMenuItem?
     private var orbitGlintsItem: NSMenuItem?
+    private var orbitSpeedModeItems: [NSMenuItem] = []
     private var ringStyleItems: [NSMenuItem] = []
     private var stateTimer: Timer?
     private var frameTimer: Timer?
@@ -1654,6 +1854,7 @@ final class LimitRingsApp: NSObject {
     private var currentPetOverlayWindowNumber: Int?
     private var currentPetOverlayWindowLayer: Int?
     private var currentPetDisplayId: CGDirectDisplayID?
+    private var currentPetDisplayBounds: CGRect?
     private var lastPanelFrame: CGRect?
     private var lastPanelOrderWindowNumber: Int?
     private var lastOverlayWindowMatchRefreshAt: Date?
@@ -1665,8 +1866,15 @@ final class LimitRingsApp: NSObject {
     private var ringsVisible: Bool
     private var pixelCloudEnabled: Bool
     private var orbitGlintsEnabled: Bool
+    private var orbitSpeedMode: OrbitSpeedMode
     private var ringStyle: RingStyle
     private var stateReadInFlight = false
+    private var lifecycleObserversInstalled = false
+    private var usagePaceTracker = UsagePaceTracker()
+    private var primaryOrbitSpeedMultiplier: Float = 0.78
+    private var secondaryOrbitSpeedMultiplier: Float = 0.78
+    private var lastUsageActivityAt: Date?
+    private var lastStatePollInterval = missingLimitStatePollInterval
 
     init(config: LimitRingsConfig) {
         self.config = config
@@ -1676,6 +1884,8 @@ final class LimitRingsApp: NSObject {
         self.ringsVisible = UserDefaults.standard.object(forKey: ringsVisibleDefaultsKey) as? Bool ?? true
         self.pixelCloudEnabled = UserDefaults.standard.object(forKey: pixelCloudEnabledDefaultsKey) as? Bool ?? true
         self.orbitGlintsEnabled = UserDefaults.standard.object(forKey: orbitGlintsEnabledDefaultsKey) as? Bool ?? true
+        self.orbitSpeedMode = UserDefaults.standard.string(forKey: orbitSpeedModeDefaultsKey)
+            .flatMap(OrbitSpeedMode.init(rawValue:)) ?? .usageResponsive
         self.ringStyle = UserDefaults.standard.string(forKey: ringStyleDefaultsKey)
             .flatMap(RingStyle.init(rawValue:)) ?? config.ringStyle
         self.panel = NSPanel(
@@ -1704,6 +1914,8 @@ final class LimitRingsApp: NSObject {
         pendingGlobalStateWatcherRestart?.cancel()
         pendingFrameUpdate?.cancel()
         globalStateSource?.cancel()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+        NotificationCenter.default.removeObserver(self)
         [mouseDownMonitor, mouseDragMonitor, mouseUpMonitor, mouseMoveMonitor].compactMap { $0 }.forEach {
             NSEvent.removeMonitor($0)
         }
@@ -1715,27 +1927,86 @@ final class LimitRingsApp: NSObject {
         updateFrame()
         installGlobalStateWatcher()
         updateRingVisibility()
-
-        stateTimer = Timer.scheduledTimer(withTimeInterval: limitStatePollInterval, repeats: true) { [weak self] _ in
-            self?.updateState()
-        }
         frameTimer = Timer.scheduledTimer(withTimeInterval: petFrameFallbackPollInterval, repeats: true) { [weak self] _ in
             self?.updateFrame()
         }
         installDragFollow()
+        installLifecycleObservers()
+        applyOrbitSpeedMode()
+        updateOrbitAnimationState()
+    }
+
+    private func installLifecycleObservers() {
+        guard !lifecycleObserversInstalled else { return }
+        lifecycleObserversInstalled = true
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(rearmCompositorEffectsAfterSystemWake(_:)),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(rearmCompositorEffectsAfterSystemWake(_:)),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
+        workspaceCenter.addObserver(
+            self,
+            selector: #selector(workspaceApplicationActivated(_:)),
+            name: NSWorkspace.didActivateApplicationNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(rearmCompositorEffectsAfterDisplayChange(_:)),
+            name: NSApplication.didChangeScreenParametersNotification,
+            object: nil
+        )
+    }
+
+    @objc private func rearmCompositorEffectsAfterSystemWake(_ notification: Notification) {
+        rearmCompositorEffects(preferLiveOverlay: true)
+    }
+
+    @objc private func rearmCompositorEffectsAfterDisplayChange(_ notification: Notification) {
+        rearmCompositorEffects(preferLiveOverlay: false)
+    }
+
+    @objc private func workspaceApplicationActivated(_ notification: Notification) {
+        guard isCodexFrontmost else { return }
+        scheduleStateRead(after: 1.0)
+    }
+
+    private func rearmCompositorEffects(preferLiveOverlay: Bool) {
+        lastPanelFrame = nil
+        lastOverlayWindowMatchRefreshAt = nil
+        ringView.rearmCompositorEffects()
+        updateFrame(preferLiveOverlay: preferLiveOverlay)
+        scheduleStateRead(after: 1.0)
         updateOrbitAnimationState()
     }
 
     private func updateState() {
         guard !stateReadInFlight else { return }
+        stateTimer?.invalidate()
+        stateTimer = nil
         stateReadInFlight = true
         stateQueue.async { [weak self] in
             guard let self else { return }
             let state = self.stateReader.readLatest()
             DispatchQueue.main.async {
                 if state.hasLimitData {
+                    let pace = self.usagePaceTracker.update(with: state)
+                    self.primaryOrbitSpeedMultiplier = pace.primaryMultiplier
+                    self.secondaryOrbitSpeedMultiplier = pace.secondaryMultiplier
+                    if pace.didConsume {
+                        self.lastUsageActivityAt = state.observedAt
+                    }
                     self.lastGoodState = state
                     self.ringView.state = state
+                    self.applyOrbitSpeedMode()
                 } else if var lastGoodState = self.lastGoodState {
                     lastGoodState.source = "last-\(lastGoodState.source)"
                     self.ringView.state = lastGoodState
@@ -1745,8 +2016,39 @@ final class LimitRingsApp: NSObject {
                 self.updateSummaryMenuItem()
                 self.updateStatusBarIcon()
                 self.stateReadInFlight = false
+                self.scheduleNextStateRead()
             }
         }
+    }
+
+    private func scheduleNextStateRead() {
+        let interval: TimeInterval
+        if lastGoodState == nil {
+            interval = missingLimitStatePollInterval
+        } else if isCodexFrontmost || lastUsageActivityAt.map({ Date().timeIntervalSince($0) < usageActivityHoldInterval }) == true {
+            interval = activeLimitStatePollInterval
+        } else {
+            interval = idleLimitStatePollInterval
+        }
+        scheduleStateRead(after: interval)
+    }
+
+    private func scheduleStateRead(after interval: TimeInterval) {
+        stateTimer?.invalidate()
+        lastStatePollInterval = interval
+        stateTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: false) { [weak self] _ in
+            self?.updateState()
+        }
+    }
+
+    private var isCodexFrontmost: Bool {
+        guard let application = NSWorkspace.shared.frontmostApplication,
+              application.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            return false
+        }
+        let name = application.localizedName?.lowercased() ?? ""
+        let bundleIdentifier = application.bundleIdentifier?.lowercased() ?? ""
+        return name == "codex" || (bundleIdentifier.contains("openai") && bundleIdentifier.contains("codex"))
     }
 
     private func installGlobalStateWatcher() {
@@ -1822,6 +2124,7 @@ final class LimitRingsApp: NSObject {
             currentPetOverlayWindowNumber = nil
             currentPetOverlayWindowLayer = nil
             currentPetDisplayId = nil
+            currentPetDisplayBounds = nil
             isTrackingMouseDrag = false
             dragMouseToPetOriginOffsetAppKit = nil
             dragMouseToOverlayOriginOffsetAppKit = nil
@@ -1843,22 +2146,35 @@ final class LimitRingsApp: NSObject {
     }
 
     private func applyPetFrames(_ petFrames: PetFramesTopLeft) {
-        let nextPetFrameAppKit = appKitRectFromTopLeft(petFrames.mascot, displayId: petFrames.displayId)
-        let nextOverlayFrameAppKit = appKitRectFromTopLeft(petFrames.overlay, displayId: petFrames.displayId)
+        let nextPetFrameAppKit = appKitRectFromTopLeft(
+            petFrames.mascot,
+            displayId: petFrames.displayId,
+            displayBounds: petFrames.displayBounds
+        )
+        let nextOverlayFrameAppKit = appKitRectFromTopLeft(
+            petFrames.overlay,
+            displayId: petFrames.displayId,
+            displayBounds: petFrames.displayBounds
+        )
         let petFrameChanged = currentPetFrameAppKit.map { !framesAreClose($0, nextPetFrameAppKit) } ?? true
         let overlayFrameChanged = currentPetOverlayFrameAppKit.map { !framesAreClose($0, nextOverlayFrameAppKit) } ?? true
-        let displayChanged = currentPetDisplayId != petFrames.displayId
+        let displayChanged = currentPetDisplayId != petFrames.displayId || currentPetDisplayBounds != petFrames.displayBounds
 
         currentPetFrameAppKit = nextPetFrameAppKit
         currentPetOverlayTopLeft = petFrames.overlay
         currentPetOverlayFrameAppKit = nextOverlayFrameAppKit
         currentPetDisplayId = petFrames.displayId
+        currentPetDisplayBounds = petFrames.displayBounds
 
         if overlayWindowMatchNeedsRefresh(overlayFrameChanged: overlayFrameChanged, displayChanged: displayChanged) {
             refreshCurrentPetOverlayWindowNumber()
         }
         if petFrameChanged || displayChanged || lastPanelFrame == nil {
-            setPanelFrame(forPetFrameTopLeft: petFrames.mascot, displayId: petFrames.displayId)
+            setPanelFrame(
+                forPetFrameTopLeft: petFrames.mascot,
+                displayId: petFrames.displayId,
+                displayBounds: petFrames.displayBounds
+            )
         }
         if ringsVisible, !panel.isVisible || overlayFrameChanged || displayChanged || lastPanelOrderWindowNumber != currentPetOverlayWindowNumber {
             showPanel()
@@ -1870,12 +2186,17 @@ final class LimitRingsApp: NSObject {
         }
     }
 
-    private func setPanelFrame(forPetFrameTopLeft petFrame: CGRect, displayId: CGDirectDisplayID?) {
+    private func setPanelFrame(forPetFrameTopLeft petFrame: CGRect, displayId: CGDirectDisplayID?, displayBounds: CGRect?) {
         let padding: CGFloat = 38
         let size = max(petFrame.width, petFrame.height) + padding * 2
         let center = visualRingCenter(for: petFrame)
         let topLeft = CGPoint(x: center.x - size / 2, y: center.y - size / 2)
-        let origin = appKitOriginFromTopLeft(topLeft, size: CGSize(width: size, height: size), displayId: displayId)
+        let origin = appKitOriginFromTopLeft(
+            topLeft,
+            size: CGSize(width: size, height: size),
+            displayId: displayId,
+            displayBounds: displayBounds
+        )
 
         applyPanelFrame(CGRect(origin: origin, size: CGSize(width: size, height: size)))
     }
@@ -1940,6 +2261,18 @@ final class LimitRingsApp: NSObject {
     private func updateOrbitAnimationState() {
         ringView.orbitsEnabled = ringsVisible && orbitGlintsEnabled && currentPetFrameAppKit != nil && ringStyle.usesOrbitHighlights
         ringView.pixelCloudEnabled = ringsVisible && pixelCloudEnabled && currentPetFrameAppKit != nil
+    }
+
+    private func applyOrbitSpeedMode() {
+        switch orbitSpeedMode {
+        case .calm:
+            ringView.setOrbitSpeedMultipliers(primary: 1.0, secondary: 1.0)
+        case .usageResponsive:
+            ringView.setOrbitSpeedMultipliers(
+                primary: primaryOrbitSpeedMultiplier,
+                secondary: secondaryOrbitSpeedMultiplier
+            )
+        }
     }
 
     private func refreshCurrentPetOverlayWindowNumber() {
@@ -2075,6 +2408,18 @@ final class LimitRingsApp: NSObject {
         menu.addItem(glintsItem)
         orbitGlintsItem = glintsItem
 
+        let speedRoot = NSMenuItem(title: "Glint Speed", action: nil, keyEquivalent: "")
+        let speedMenu = NSMenu()
+        orbitSpeedModeItems = OrbitSpeedMode.allCases.map { mode in
+            let item = NSMenuItem(title: mode.menuTitle, action: #selector(selectOrbitSpeedMode(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = mode.rawValue
+            speedMenu.addItem(item)
+            return item
+        }
+        menu.addItem(speedRoot)
+        menu.setSubmenu(speedMenu, for: speedRoot)
+
         let styleRoot = NSMenuItem(title: "Ring Style", action: nil, keyEquivalent: "")
         let styleMenu = NSMenu()
         ringStyleItems = RingStyle.allCases.map { style in
@@ -2106,6 +2451,7 @@ final class LimitRingsApp: NSObject {
         updateSummaryMenuItem()
         updateShowRingsMenuItem()
         updateDecorationMenuItems()
+        updateOrbitSpeedModeMenuItems()
         updateRingStyleMenuItems()
     }
 
@@ -2239,6 +2585,13 @@ final class LimitRingsApp: NSObject {
         orbitGlintsItem?.state = orbitGlintsEnabled ? .on : .off
     }
 
+    private func updateOrbitSpeedModeMenuItems() {
+        for item in orbitSpeedModeItems {
+            let itemMode = (item.representedObject as? String).flatMap(OrbitSpeedMode.init(rawValue:))
+            item.state = itemMode == orbitSpeedMode ? .on : .off
+        }
+    }
+
     private func updateRingStyleMenuItems() {
         for item in ringStyleItems {
             let itemStyle = (item.representedObject as? String).flatMap(RingStyle.init(rawValue:))
@@ -2278,6 +2631,14 @@ final class LimitRingsApp: NSObject {
         updateOrbitAnimationState()
     }
 
+    private func setOrbitSpeedMode(_ mode: OrbitSpeedMode) {
+        guard orbitSpeedMode != mode else { return }
+        orbitSpeedMode = mode
+        UserDefaults.standard.set(mode.rawValue, forKey: orbitSpeedModeDefaultsKey)
+        updateOrbitSpeedModeMenuItems()
+        applyOrbitSpeedMode()
+    }
+
     private func setRingStyle(_ style: RingStyle) {
         guard ringStyle != style else { return }
         ringStyle = style
@@ -2297,6 +2658,14 @@ final class LimitRingsApp: NSObject {
 
     @objc private func toggleOrbitGlints(_ sender: NSMenuItem) {
         setOrbitGlintsEnabled(!orbitGlintsEnabled)
+    }
+
+    @objc private func selectOrbitSpeedMode(_ sender: NSMenuItem) {
+        guard let rawMode = sender.representedObject as? String,
+              let mode = OrbitSpeedMode(rawValue: rawMode) else {
+            return
+        }
+        setOrbitSpeedMode(mode)
     }
 
     @objc private func selectRingStyle(_ sender: NSMenuItem) {
@@ -2408,7 +2777,11 @@ final class LimitRingsApp: NSObject {
 
         if let petFrames = frameReader.readPetFramesTopLeft(preferLiveOverlay: true, liveReference: liveReference),
            petFrames.usedLiveOverlay {
-            let livePetFrame = appKitRectFromTopLeft(petFrames.mascot, displayId: petFrames.displayId)
+            let livePetFrame = appKitRectFromTopLeft(
+                petFrames.mascot,
+                displayId: petFrames.displayId,
+                displayBounds: petFrames.displayBounds
+            )
             if let predictedPetFrame {
                 guard dragLiveFrameIsClose(livePetFrame, to: predictedPetFrame) else {
                     applyPredictedDragFrame(petFrame: predictedPetFrame, overlayFrame: predictedOverlayFrame)
@@ -2457,7 +2830,11 @@ final class LimitRingsApp: NSObject {
         currentPetFrameAppKit = petFrame
         if let overlayFrame {
             currentPetOverlayFrameAppKit = overlayFrame
-            currentPetOverlayTopLeft = topLeftRectFromAppKit(overlayFrame, displayId: currentPetDisplayId)
+            currentPetOverlayTopLeft = topLeftRectFromAppKit(
+                overlayFrame,
+                displayId: currentPetDisplayId,
+                displayBounds: currentPetDisplayBounds
+            )
             refreshCurrentPetOverlayWindowNumber()
         }
         setPanelFrame(forPetFrameAppKit: petFrame)
@@ -2549,24 +2926,24 @@ final class LimitRingsApp: NSObject {
         return distance >= radius - 24.0 && distance <= radius + 19.0
     }
 
-    private func appKitOriginFromTopLeft(_ topLeft: CGPoint, size: CGSize, displayId: CGDirectDisplayID?) -> CGPoint {
+    private func appKitOriginFromTopLeft(_ topLeft: CGPoint, size: CGSize, displayId: CGDirectDisplayID?, displayBounds: CGRect?) -> CGPoint {
         let topLeftRect = CGRect(origin: topLeft, size: size)
-        guard let screen = screenForTopLeftRect(topLeftRect, displayId: displayId) else {
+        guard let screen = screenForTopLeftRect(topLeftRect, displayId: displayId, displayBounds: displayBounds) else {
             return CGPoint(x: topLeft.x, y: max(0, config.fallbackSize - topLeft.y))
         }
 
-        let screenTopLeftFrame = coordinateTopLeftFrame(for: screen, displayId: displayId)
+        let screenTopLeftFrame = coordinateTopLeftFrame(for: screen, displayBounds: displayBounds)
         let localX = topLeft.x - screenTopLeftFrame.minX
         let localY = topLeft.y - screenTopLeftFrame.minY
         return CGPoint(x: screen.frame.minX + localX, y: screen.frame.maxY - localY - size.height)
     }
 
-    private func appKitRectFromTopLeft(_ rect: CGRect, displayId: CGDirectDisplayID?) -> CGRect {
-        guard let screen = screenForTopLeftRect(rect, displayId: displayId) else {
+    private func appKitRectFromTopLeft(_ rect: CGRect, displayId: CGDirectDisplayID?, displayBounds: CGRect?) -> CGRect {
+        guard let screen = screenForTopLeftRect(rect, displayId: displayId, displayBounds: displayBounds) else {
             return rect
         }
 
-        let screenTopLeftFrame = coordinateTopLeftFrame(for: screen, displayId: displayId)
+        let screenTopLeftFrame = coordinateTopLeftFrame(for: screen, displayBounds: displayBounds)
         let localX = rect.minX - screenTopLeftFrame.minX
         let localY = rect.minY - screenTopLeftFrame.minY
         return CGRect(
@@ -2577,12 +2954,12 @@ final class LimitRingsApp: NSObject {
         )
     }
 
-    private func topLeftRectFromAppKit(_ rect: CGRect, displayId: CGDirectDisplayID?) -> CGRect? {
+    private func topLeftRectFromAppKit(_ rect: CGRect, displayId: CGDirectDisplayID?, displayBounds: CGRect?) -> CGRect? {
         guard let screen = screenForAppKitRect(rect, displayId: displayId) else {
             return nil
         }
 
-        let screenTopLeftFrame = coordinateTopLeftFrame(for: screen, displayId: displayId)
+        let screenTopLeftFrame = coordinateTopLeftFrame(for: screen, displayBounds: displayBounds)
         let localX = rect.minX - screen.frame.minX
         let localY = screen.frame.maxY - rect.maxY
         return CGRect(
@@ -2594,17 +2971,18 @@ final class LimitRingsApp: NSObject {
     }
 
     private func globalTopLeftRectFromAppKit(_ rect: CGRect) -> CGRect? {
-        topLeftRectFromAppKit(rect, displayId: nil)
+        topLeftRectFromAppKit(rect, displayId: nil, displayBounds: nil)
     }
 
-    private func screenForTopLeftRect(_ rect: CGRect, displayId: CGDirectDisplayID?) -> NSScreen? {
+    private func screenForTopLeftRect(_ rect: CGRect, displayId: CGDirectDisplayID?, displayBounds: CGRect?) -> NSScreen? {
         if let displayId, let screen = screenForDisplayId(displayId) {
             return screen
         }
 
         let screens = NSScreen.screens
         guard !screens.isEmpty else { return nil }
-        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let reference = displayBounds ?? rect
+        let center = CGPoint(x: reference.midX, y: reference.midY)
         if let screen = screens.first(where: { topLeftFrame(for: $0).contains(center) }) {
             return screen
         }
@@ -2641,11 +3019,8 @@ final class LimitRingsApp: NSObject {
         )
     }
 
-    private func coordinateTopLeftFrame(for screen: NSScreen, displayId: CGDirectDisplayID?) -> CGRect {
-        if displayId != nil {
-            return CGRect(x: 0, y: 0, width: screen.frame.width, height: screen.frame.height)
-        }
-        return topLeftFrame(for: screen)
+    private func coordinateTopLeftFrame(for screen: NSScreen, displayBounds: CGRect?) -> CGRect {
+        displayBounds ?? topLeftFrame(for: screen)
     }
 
     private func primaryScreen() -> NSScreen? {
@@ -2681,9 +3056,16 @@ final class LimitRingsApp: NSObject {
             "ringStyle: \(ringStyle.rawValue)",
             "pixelCloudEnabled: \(pixelCloudEnabled)",
             "orbitGlintsEnabled: \(orbitGlintsEnabled)",
+            "orbitSpeedMode: \(orbitSpeedMode.rawValue)",
+            "primaryOrbitSpeedMultiplier: \(primaryOrbitSpeedMultiplier)",
+            "secondaryOrbitSpeedMultiplier: \(secondaryOrbitSpeedMultiplier)",
+            "statePollInterval: \(lastStatePollInterval)",
+            "codexFrontmost: \(isCodexFrontmost)",
+            "lastUsageActivityAt: \(lastUsageActivityAt.map { ISO8601DateFormatter().string(from: $0) } ?? "none")",
             "panelVisible: \(panel.isVisible)",
             "trackingDrag: \(isTrackingMouseDrag)",
             "displayId: \(displayId)",
+            "displayBounds: \(formatRect(currentPetDisplayBounds))",
             "overlayWindowNumber: \(currentPetOverlayWindowNumber.map(String.init) ?? "none")",
             "overlayWindowLayer: \(currentPetOverlayWindowLayer.map(String.init) ?? "none")",
             "panelLevel: \(panel.level.rawValue)",
@@ -2696,7 +3078,7 @@ final class LimitRingsApp: NSObject {
             "lastPanelFrame: \(formatRect(lastPanelFrame))",
             "orbitsEnabled: \(ringView.orbitsEnabled)",
             "viewPixelCloudEnabled: \(ringView.pixelCloudEnabled)"
-        ]
+        ] + ringView.compositorDebugLines
 
         for (index, screen) in NSScreen.screens.enumerated() {
             lines.append("screen[\(index)]: \(screenDebugDescription(screen))")

@@ -19,6 +19,7 @@ The rings are designed to be glanceable:
 - `Ring Style` lets you switch between `Segmented Pixel`, `Classic Glow`, and `CRT Glow`.
 - `Pixel Cloud` toggles the quiet outer-ring pixel aura across all styles.
 - `Orbiting Glints` toggles the small animated square highlights independently of the pixel cloud.
+- `Glint Speed` switches between the original calm cadence and a smoothed usage-responsive cadence for each limit ring.
 - Hovering over the pet or rings shows the exact percentages at the current ring endpoints.
 - The menu also lets you hide the rings, refresh data, copy debug geometry, or quit.
 
@@ -42,7 +43,7 @@ Install the rings as a login item:
 tools/install-limit-rings.sh
 ```
 
-You should see a small rings icon in the macOS menu bar. Use that menu to toggle `Show Rings`, choose a ring style, enable or disable `Pixel Cloud` and `Orbiting Glints`, refresh the latest usage data, copy debug geometry, or quit.
+You should see a small rings icon in the macOS menu bar. Use that menu to toggle `Show Rings`, choose a ring style and glint speed, enable or disable `Pixel Cloud` and `Orbiting Glints`, refresh the latest usage data, copy debug geometry, or quit.
 
 Then use any Codex pet normally. No pet setup step is required.
 
