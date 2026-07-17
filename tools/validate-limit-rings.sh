@@ -20,6 +20,8 @@ swiftc \
   -framework QuartzCore \
   -lsqlite3
 
+"$BIN" --self-test
+
 for style in segmented-pixel classic-glow crt-glow; do
   "$BIN" \
     --preview "$TMP_DIR/limit-rings-$style.png" \

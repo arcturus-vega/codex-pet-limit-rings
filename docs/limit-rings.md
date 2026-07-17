@@ -35,7 +35,7 @@ The app reads live usage first, then local files as support or fallback:
 - `electron-avatar-overlay-open` in the same state file: whether the Codex pet is currently open.
 - `~/.codex/logs_2.sqlite`: fallback source using the newest `codex.rate_limits` event when the live usage call fails.
 
-The app watches `~/.codex/.codex-global-state.json` with a macOS file event source, so pet open/close and position writes trigger an immediate frame update. A slow frame timer remains as a fallback in case the file is replaced or an event is missed. Pet coordinates are resolved against the display recorded by Codex when available. When Codex reports `displayBounds`, that frame is used as the top-left coordinate origin for the target display, which keeps secondary-monitor offsets from being treated as display-local zero-based coordinates.
+The app watches `~/.codex/.codex-global-state.json` with a macOS file event source, so pet open/close and position writes trigger an immediate frame update. A slow frame timer remains as a fallback in case the file is replaced or an event is missed. Pet coordinates are resolved against the display recorded by Codex when available. When Codex reports `displayBounds`, that frame is used as the top-left coordinate origin for the target display, which keeps secondary-monitor offsets from being treated as display-local zero-based coordinates. The frame reader accepts both the original complete overlay record and the newer abbreviated per-display record. In the abbreviated form, `x` and `y` are treated as the mascot anchor while compatible saved display geometry supplies its size and overlay offset; a conservative built-in geometry is used only when Codex has not retained any detailed display record.
 
 No OpenAI API key is required. The menu summary says `Live` when the direct usage read succeeds and `Cached` when it is showing the local event-log fallback.
 
@@ -107,7 +107,7 @@ Run the standard hygiene check:
 tools/validate-limit-rings.sh
 ```
 
-That script checks shell syntax, compiles the app, renders previews for every ring style, builds an app bundle under `tmp/`, and runs `git diff --check` when available.
+That script checks shell syntax, compiles the app, runs synthetic old/new pet-state schema tests, renders previews for every ring style, builds an app bundle under `tmp/`, and runs `git diff --check` when available.
 
 Render a static preview:
 

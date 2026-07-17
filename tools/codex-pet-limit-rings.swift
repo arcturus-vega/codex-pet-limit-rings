@@ -129,6 +129,12 @@ private func distanceSquaredFromCenter(_ point: CGPoint, to rect: CGRect) -> CGF
     return dx * dx + dy * dy
 }
 
+private func isCodexWindowOwner(_ value: Any?) -> Bool {
+    guard let owner = value as? String else { return false }
+    return owner.caseInsensitiveCompare("Codex") == .orderedSame ||
+        owner.caseInsensitiveCompare("ChatGPT") == .orderedSame
+}
+
 private func formatUsagePercent(_ percent: Double) -> String {
     if abs(percent.rounded() - percent) < 0.05 {
         return "\(Int(percent.rounded()))%"
@@ -435,6 +441,7 @@ struct LimitRingsConfig {
     var logsPath: URL
     var authPath: URL
     var previewPath: URL?
+    var runSelfTests = false
     var ringStyle: RingStyle = .segmentedPixel
     var fallbackSize: CGFloat = 220
 }
@@ -616,6 +623,11 @@ struct PetFramesTopLeft {
 }
 
 final class PetFrameReader {
+    private struct PersistedGeometry {
+        var overlaySize: CGSize
+        var mascotInOverlay: CGRect
+    }
+
     private let globalStatePath: URL
 
     init(globalStatePath: URL) {
@@ -624,35 +636,211 @@ final class PetFrameReader {
 
     func readPetFramesTopLeft(preferLiveOverlay: Bool = false, liveReference: CGRect? = nil) -> PetFramesTopLeft? {
         guard let data = try? Data(contentsOf: globalStatePath),
-              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              isAvatarOverlayOpen(root),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+
+        return readPetFramesTopLeft(from: root, preferLiveOverlay: preferLiveOverlay, liveReference: liveReference)
+    }
+
+    static func runSyntheticStateTests() -> Bool {
+        let reader = PetFrameReader(globalStatePath: URL(fileURLWithPath: "/dev/null"))
+        let displayBounds: [String: Any] = ["x": 0, "y": 0, "width": 2560, "height": 1440]
+        let detailedBounds: [String: Any] = [
+            "x": 1875,
+            "y": 103,
+            "width": 356,
+            "height": 320,
+            "displayId": 2,
+            "displayBounds": displayBounds,
+            "mascot": ["left": 215, "top": 30, "width": 113, "height": 123]
+        ]
+        var legacyBounds = detailedBounds
+        legacyBounds["byDisplayId"] = [
+            "2": [
+                "x": 100,
+                "y": 200,
+                "width": 356,
+                "height": 320,
+                "displayId": 2,
+                "displayBounds": displayBounds,
+                "mascot": ["left": 215, "top": 30, "width": 113, "height": 123]
+            ]
+        ]
+        let oldRoot: [String: Any] = [
+            "electron-avatar-overlay-open": true,
+            "electron-avatar-overlay-bounds": legacyBounds
+        ]
+        guard let oldFrames = reader.readPetFramesTopLeft(from: oldRoot),
+              oldFrames.overlay == CGRect(x: 1875, y: 103, width: 356, height: 320),
+              oldFrames.mascot == CGRect(x: 2090, y: 133, width: 113, height: 123) else {
+            fputs("codex-pet-limit-rings: legacy pet-state self-test failed\n", stderr)
+            return false
+        }
+
+        let abbreviatedRoot: [String: Any] = [
+            "electron-avatar-overlay-open": true,
+            "electron-avatar-overlay-bounds": [
+                "x": 2358,
+                "y": 158,
+                "displayId": 1,
+                "displayBounds": displayBounds,
+                "byDisplayId": ["1": ["x": 2358, "y": 158, "displayId": 1, "displayBounds": displayBounds], "2": detailedBounds]
+            ]
+        ]
+        guard let abbreviatedFrames = reader.readPetFramesTopLeft(from: abbreviatedRoot),
+              abbreviatedFrames.overlay == CGRect(x: 2143, y: 128, width: 356, height: 320),
+              abbreviatedFrames.mascot == CGRect(x: 2358, y: 158, width: 113, height: 123),
+              abbreviatedFrames.displayId == 1 else {
+            fputs("codex-pet-limit-rings: abbreviated pet-state self-test failed\n", stderr)
+            return false
+        }
+
+        let closedRoot: [String: Any] = [
+            "electron-avatar-overlay-open": false,
+            "electron-avatar-overlay-bounds": detailedBounds
+        ]
+        guard reader.readPetFramesTopLeft(from: closedRoot) == nil else {
+            fputs("codex-pet-limit-rings: closed-pet self-test failed\n", stderr)
+            return false
+        }
+        return true
+    }
+
+    private func readPetFramesTopLeft(
+        from root: [String: Any],
+        preferLiveOverlay: Bool = false,
+        liveReference: CGRect? = nil
+    ) -> PetFramesTopLeft? {
+        guard isAvatarOverlayOpen(root),
               let bounds = root["electron-avatar-overlay-bounds"] as? [String: Any],
-              let x = number(bounds["x"]),
-              let y = number(bounds["y"]),
-              let overlayWidth = number(bounds["width"]),
-              let overlayHeight = number(bounds["height"]),
-              let mascotPayload = bounds["mascot"] as? [String: Any],
+              let persisted = persistedFrames(from: bounds) else {
+            return nil
+        }
+
+        let liveOverlay = preferLiveOverlay
+            ? liveCodexOverlayBounds(matching: liveReference ?? persisted.overlay, expectedSize: persisted.overlay.size)
+            : nil
+        let overlay = liveOverlay ?? persisted.overlay
+        let mascotOffset = CGPoint(
+            x: persisted.mascot.minX - persisted.overlay.minX,
+            y: persisted.mascot.minY - persisted.overlay.minY
+        )
+        let mascot = CGRect(
+            x: overlay.minX + mascotOffset.x,
+            y: overlay.minY + mascotOffset.y,
+            width: persisted.mascot.width,
+            height: persisted.mascot.height
+        )
+        return PetFramesTopLeft(
+            mascot: mascot,
+            overlay: overlay,
+            displayId: liveOverlay == nil ? persisted.displayId : nil,
+            displayBounds: liveOverlay == nil ? persisted.displayBounds : nil,
+            usedLiveOverlay: liveOverlay != nil
+        )
+    }
+
+    private func persistedFrames(from bounds: [String: Any]) -> PetFramesTopLeft? {
+        let displayId = directDisplayId(bounds["displayId"])
+        let displayBounds = rect(bounds["displayBounds"])
+        let activeDisplayPayload = displayId.flatMap { id in
+            (bounds["byDisplayId"] as? [String: Any])?[String(id)] as? [String: Any]
+        }
+        let positionPayload = activeDisplayPayload ?? bounds
+
+        if let complete = completeFrames(from: bounds, fallbackDisplayId: displayId, fallbackDisplayBounds: displayBounds) {
+            return complete
+        }
+        if let complete = completeFrames(from: positionPayload, fallbackDisplayId: displayId, fallbackDisplayBounds: displayBounds) {
+            return complete
+        }
+
+        guard let anchorX = number(positionPayload["x"] ?? bounds["x"]),
+              let anchorY = number(positionPayload["y"] ?? bounds["y"]) else {
+            return nil
+        }
+        let resolvedDisplayId = directDisplayId(positionPayload["displayId"]) ?? displayId
+        let resolvedDisplayBounds = rect(positionPayload["displayBounds"]) ?? displayBounds
+        let geometry = geometryTemplate(in: bounds, displayBounds: resolvedDisplayBounds) ?? Self.defaultPersistedGeometry
+        let mascot = CGRect(
+            x: anchorX,
+            y: anchorY,
+            width: geometry.mascotInOverlay.width,
+            height: geometry.mascotInOverlay.height
+        )
+        let overlay = CGRect(
+            x: anchorX - geometry.mascotInOverlay.minX,
+            y: anchorY - geometry.mascotInOverlay.minY,
+            width: geometry.overlaySize.width,
+            height: geometry.overlaySize.height
+        )
+        return PetFramesTopLeft(
+            mascot: mascot,
+            overlay: overlay,
+            displayId: resolvedDisplayId,
+            displayBounds: resolvedDisplayBounds,
+            usedLiveOverlay: false
+        )
+    }
+
+    private func completeFrames(
+        from payload: [String: Any],
+        fallbackDisplayId: CGDirectDisplayID?,
+        fallbackDisplayBounds: CGRect?
+    ) -> PetFramesTopLeft? {
+        guard let x = number(payload["x"]),
+              let y = number(payload["y"]),
+              let geometry = geometry(from: payload) else {
+            return nil
+        }
+        let overlay = CGRect(origin: CGPoint(x: x, y: y), size: geometry.overlaySize)
+        return PetFramesTopLeft(
+            mascot: geometry.mascotInOverlay.offsetBy(dx: x, dy: y),
+            overlay: overlay,
+            displayId: directDisplayId(payload["displayId"]) ?? fallbackDisplayId,
+            displayBounds: rect(payload["displayBounds"]) ?? fallbackDisplayBounds,
+            usedLiveOverlay: false
+        )
+    }
+
+    private func geometryTemplate(in bounds: [String: Any], displayBounds: CGRect?) -> PersistedGeometry? {
+        var payloads: [[String: Any]] = []
+        if let byDisplay = bounds["byDisplayId"] as? [String: Any] {
+            payloads.append(contentsOf: byDisplay.values.compactMap { $0 as? [String: Any] })
+        }
+        if let byResolution = bounds["byResolution"] as? [String: Any] {
+            payloads.append(contentsOf: byResolution.values.compactMap { $0 as? [String: Any] })
+        }
+        let matchingDisplay = payloads.first { payload in
+            guard let candidateBounds = rect(payload["displayBounds"]), let displayBounds else { return false }
+            return abs(candidateBounds.width - displayBounds.width) < 1.0 &&
+                abs(candidateBounds.height - displayBounds.height) < 1.0 &&
+                geometry(from: payload) != nil
+        }
+        return matchingDisplay.flatMap(geometry(from:)) ?? payloads.compactMap(geometry(from:)).first
+    }
+
+    private func geometry(from payload: [String: Any]) -> PersistedGeometry? {
+        guard let overlayWidth = number(payload["width"]),
+              let overlayHeight = number(payload["height"]),
+              let mascotPayload = payload["mascot"] as? [String: Any],
               let left = number(mascotPayload["left"]),
               let top = number(mascotPayload["top"]),
               let width = number(mascotPayload["width"]),
               let height = number(mascotPayload["height"]) else {
             return nil
         }
-
-        let displayId = directDisplayId(bounds["displayId"])
-        let displayBounds = rect(bounds["displayBounds"])
-        let persistedOverlay = CGRect(x: x, y: y, width: overlayWidth, height: overlayHeight)
-        let liveOverlay = preferLiveOverlay ? liveCodexOverlayBounds(matching: liveReference ?? persistedOverlay, expectedSize: persistedOverlay.size) : nil
-        let overlay = liveOverlay ?? persistedOverlay
-        let mascot = CGRect(x: overlay.minX + left, y: overlay.minY + top, width: width, height: height)
-        return PetFramesTopLeft(
-            mascot: mascot,
-            overlay: overlay,
-            displayId: liveOverlay == nil ? displayId : nil,
-            displayBounds: liveOverlay == nil ? displayBounds : nil,
-            usedLiveOverlay: liveOverlay != nil
+        return PersistedGeometry(
+            overlaySize: CGSize(width: overlayWidth, height: overlayHeight),
+            mascotInOverlay: CGRect(x: left, y: top, width: width, height: height)
         )
     }
+
+    private static let defaultPersistedGeometry = PersistedGeometry(
+        overlaySize: CGSize(width: 356, height: 320),
+        mascotInOverlay: CGRect(x: 215, y: 30, width: 113, height: 123)
+    )
 
     private func isAvatarOverlayOpen(_ root: [String: Any]) -> Bool {
         if let isOpen = root["electron-avatar-overlay-open"] as? Bool {
@@ -710,7 +898,7 @@ final class PetFrameReader {
         return windows.compactMap { window -> CGRect? in
             let maxWidthDelta = max(80.0, expectedSize.width * 0.55)
             let maxHeightDelta = max(80.0, expectedSize.height * 0.55)
-            guard (window[kCGWindowOwnerName as String] as? String) == "Codex",
+            guard isCodexWindowOwner(window[kCGWindowOwnerName as String]),
                   let layer = number(window[kCGWindowLayer as String]),
                   layer > 0,
                   let bounds = window[kCGWindowBounds as String] as? [String: Any],
@@ -2320,7 +2508,7 @@ final class LimitRingsApp: NSObject {
         return windows.compactMap { window -> (match: CodexOverlayWindowMatch, score: CGFloat)? in
             let maxWidthDelta = max(80.0, expectedSize.width * 0.55)
             let maxHeightDelta = max(80.0, expectedSize.height * 0.55)
-            guard (window[kCGWindowOwnerName as String] as? String) == "Codex",
+            guard isCodexWindowOwner(window[kCGWindowOwnerName as String]),
                   let layer = cgInt(window[kCGWindowLayer as String]),
                   layer > 0,
                   let windowNumber = cgInt(window[kCGWindowNumber as String]),
@@ -3165,7 +3353,7 @@ func parseConfig() -> LimitRingsConfig? {
         switch arg {
         case "--help", "-h":
             print("""
-            Usage: codex-pet-limit-rings [--preview PATH] [--style STYLE] [--codex-home PATH] [--logs PATH] [--auth PATH] [--state PATH]
+            Usage: codex-pet-limit-rings [--preview PATH] [--style STYLE] [--self-test] [--codex-home PATH] [--logs PATH] [--auth PATH] [--state PATH]
 
             Draws a transparent Codex rate-limit rings around the current pet.
             Styles: \(RingStyle.allCases.map(\.rawValue).joined(separator: ", "))
@@ -3175,6 +3363,8 @@ func parseConfig() -> LimitRingsConfig? {
             guard let value = args.first else { return nil }
             args.removeFirst()
             config.previewPath = URL(fileURLWithPath: value)
+        case "--self-test":
+            config.runSelfTests = true
         case "--codex-home":
             guard let value = args.first else { return nil }
             args.removeFirst()
@@ -3227,6 +3417,10 @@ func defaultLogsPath(codexHome: URL) -> URL {
 guard let config = parseConfig() else {
     fputs("codex-pet-limit-rings: invalid arguments. Use --help.\n", stderr)
     exit(2)
+}
+
+if config.runSelfTests {
+    exit(PetFrameReader.runSyntheticStateTests() ? 0 : 1)
 }
 
 if config.previewPath != nil {
