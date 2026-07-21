@@ -66,9 +66,10 @@ Keep future changes inside the narrowest matching area. A larger source split ca
 - Exact percentages are shown only on hover to keep the pet feeling ambient rather than dashboard-like.
 - Additional model-limit buckets may appear as small outer markers when available.
 - Small square orbit highlights are compositor-driven layer animations and can be toggled independently, so the rings can stay lively without forcing continuous AppKit redraws.
-- Usage-responsive glints adjust the playback rate of those existing Core Animation layers without adding a display timer. Speed changes preserve the current orbit phase, remain bounded, and are smoothed over time to avoid jumps when usage snapshots update in batches.
+- Usage-responsive glints adjust the playback rate of those existing Core Animation layers without adding a display timer. Speed changes preserve the current orbit phase, remain bounded, and are smoothed over time to avoid jumps when usage snapshots update in batches. Small rate changes are ignored, routine compositor retiming is limited to once every 30 seconds, and large usage changes still take effect immediately.
 - Subtle static pixel dither appears around glow styles, while optional live outer-ring dust uses a low-rate outline emitter with a lighter wander layer so the effect feels like a quiet pixel aura and remains lightweight.
 - Compositor-backed dust and orbit layers are re-armed after system wake or display changes, so a stale `CAEmitterLayer` can recover without asking the user to toggle the pixel cloud manually.
+- Minor sprite-frame size and center changes are absorbed by the ring window rather than rebuilding or shifting orbit paths on every pet animation frame. Deliberate pet resizing still updates the ring geometry once the size change clears the small hysteresis band, and active dragging bypasses center stabilization entirely.
 
 ## Install Contract
 
@@ -107,7 +108,7 @@ Run the standard hygiene check:
 tools/validate-limit-rings.sh
 ```
 
-That script checks shell syntax, compiles the app, runs synthetic old/new pet-state schema tests, renders previews for every ring style, builds an app bundle under `tmp/`, and runs `git diff --check` when available.
+That script checks shell syntax, compiles the app, runs synthetic pet-state schema and orbit-timing continuity tests, renders previews for every ring style, builds an app bundle under `tmp/`, and runs `git diff --check` when available.
 
 Render a static preview:
 

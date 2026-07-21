@@ -120,7 +120,7 @@ Run the standard validation pass:
 tools/validate-limit-rings.sh
 ```
 
-That script checks shell syntax, compiles the app, renders previews for every ring style, builds an app bundle under `tmp/`, and runs `git diff --check` when available.
+That script checks shell syntax, compiles the app, runs synthetic pet-state schema and orbit-timing continuity tests, renders previews for every ring style, builds an app bundle under `tmp/`, and runs `git diff --check` when available.
 
 Build the app:
 

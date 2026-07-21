@@ -80,9 +80,12 @@ private let missingLimitStatePollInterval: TimeInterval = 20.0
 private let usageActivityHoldInterval: TimeInterval = 5.0 * 60.0
 private let petFrameFallbackPollInterval: TimeInterval = 2.0
 private let petFrameStateDebounceInterval: TimeInterval = 0.035
+private let petFrameLossGraceInterval: TimeInterval = 3.0
 private let dragFollowInterval: TimeInterval = 1.0 / 60.0
 private let dragLiveMismatchTolerance: CGFloat = 96.0
 private let panelFrameUpdateTolerance: CGFloat = 0.5
+private let panelSizeHysteresis: CGFloat = 4.0
+private let panelCenterHysteresis: CGFloat = 2.0
 private let overlayWindowMatchRefreshInterval: TimeInterval = 12.0
 private let petVisualCenterYOffsetFraction: CGFloat = 0.0
 private let ringsVisibleDefaultsKey = "CodexPetLimitRings.ringsVisible"
@@ -293,6 +296,86 @@ enum OrbitSpeedMode: String, CaseIterable {
         case .usageResponsive:
             return "Usage Responsive"
         }
+    }
+}
+
+private struct OrbitSpeedUpdatePolicy {
+    static let minimumRateDelta: Float = 0.09
+    static let immediateRateDelta: Float = 0.25
+    static let minimumUpdateInterval: CFTimeInterval = 30.0
+
+    static func shouldApply(
+        current: Float,
+        target: Float,
+        lastAppliedAt: CFTimeInterval?,
+        now: CFTimeInterval,
+        force: Bool
+    ) -> Bool {
+        if force { return true }
+        let delta = abs(target - current)
+        guard delta >= minimumRateDelta else { return false }
+        if delta >= immediateRateDelta { return true }
+        guard let lastAppliedAt else { return true }
+        return now - lastAppliedAt >= minimumUpdateInterval
+    }
+
+    static func runSyntheticTests() -> Bool {
+        let checks = [
+            !shouldApply(current: 1.30, target: 1.27, lastAppliedAt: 0, now: 40, force: false),
+            !shouldApply(current: 1.30, target: 1.20, lastAppliedAt: 20, now: 40, force: false),
+            shouldApply(current: 1.30, target: 1.20, lastAppliedAt: 0, now: 40, force: false),
+            shouldApply(current: 1.30, target: 1.60, lastAppliedAt: 38, now: 40, force: false),
+            shouldApply(current: 1.30, target: 1.31, lastAppliedAt: 39, now: 40, force: true)
+        ]
+        guard checks.allSatisfy({ $0 }) else {
+            fputs("codex-pet-limit-rings: orbit-speed policy self-test failed\n", stderr)
+            return false
+        }
+        return true
+    }
+}
+
+private struct OrbitAnimationPhase {
+    static func normalized(_ value: CFTimeInterval) -> CFTimeInterval {
+        let remainder = value.truncatingRemainder(dividingBy: 1.0)
+        return remainder >= 0.0 ? remainder : remainder + 1.0
+    }
+
+    static func current(
+        localTime: CFTimeInterval,
+        beginTime: CFTimeInterval,
+        timeOffset: CFTimeInterval,
+        speed: Float,
+        duration: CFTimeInterval
+    ) -> CFTimeInterval {
+        guard duration > 0.0 else { return 0.0 }
+        let elapsed = (localTime - beginTime) * CFTimeInterval(speed) + timeOffset
+        return normalized(elapsed / duration)
+    }
+
+    static func beginTime(
+        localTime: CFTimeInterval,
+        phase: CFTimeInterval,
+        duration: CFTimeInterval
+    ) -> CFTimeInterval {
+        localTime - normalized(phase) * duration
+    }
+
+    static func runSyntheticTests() -> Bool {
+        let phase = current(localTime: 18.0, beginTime: 2.0, timeOffset: 0.0, speed: 1.0, duration: 10.0)
+        let wrapped = current(localTime: 2.0, beginTime: 5.0, timeOffset: 0.0, speed: 1.0, duration: 10.0)
+        let preservedBeginTime = beginTime(localTime: 40.0, phase: phase, duration: 20.0)
+        let preserved = current(localTime: 40.0, beginTime: preservedBeginTime, timeOffset: 0.0, speed: 1.0, duration: 20.0)
+        let checks = [
+            abs(phase - 0.6) < 0.0001,
+            abs(wrapped - 0.7) < 0.0001,
+            abs(preserved - phase) < 0.0001
+        ]
+        guard checks.allSatisfy({ $0 }) else {
+            fputs("codex-pet-limit-rings: orbit-phase continuity self-test failed\n", stderr)
+            return false
+        }
+        return true
     }
 }
 
@@ -1578,6 +1661,9 @@ final class LimitRingView: NSView {
     private var lastDustConfiguration: DustConfiguration?
     private var outerOrbitPlaybackRate: Float = 1.0
     private var innerOrbitPlaybackRate: Float = 1.0
+    private var outerOrbitRateAppliedAt: CFTimeInterval?
+    private var innerOrbitRateAppliedAt: CFTimeInterval?
+    private var orbitAnimationInstallCount = 0
     private static let dustPixelContents = LimitRingView.makeDustPixelContents()
 
     override var isOpaque: Bool { false }
@@ -1613,15 +1699,43 @@ final class LimitRingView: NSView {
         applyOrbitPlaybackRates(force: true)
     }
 
-    func setOrbitSpeedMultipliers(primary: Float, secondary: Float) {
+    func setOrbitSpeedMultipliers(primary: Float, secondary: Float, force: Bool = false) {
         let nextOuter = min(max(primary, 0.5), 2.0)
         let nextInner = min(max(secondary, 0.5), 2.0)
-        let outerChanged = abs(nextOuter - outerOrbitPlaybackRate) >= 0.015
-        let innerChanged = abs(nextInner - innerOrbitPlaybackRate) >= 0.015
+        let now = CACurrentMediaTime()
+        let outerChanged = OrbitSpeedUpdatePolicy.shouldApply(
+            current: outerOrbitPlaybackRate,
+            target: nextOuter,
+            lastAppliedAt: outerOrbitRateAppliedAt,
+            now: now,
+            force: force
+        )
+        let innerChanged = OrbitSpeedUpdatePolicy.shouldApply(
+            current: innerOrbitPlaybackRate,
+            target: nextInner,
+            lastAppliedAt: innerOrbitRateAppliedAt,
+            now: now,
+            force: force
+        )
         guard outerChanged || innerChanged else { return }
-        outerOrbitPlaybackRate = nextOuter
-        innerOrbitPlaybackRate = nextInner
-        applyOrbitPlaybackRates(force: false)
+        if outerChanged {
+            outerOrbitPlaybackRate = nextOuter
+            outerOrbitRateAppliedAt = now
+        }
+        if innerChanged {
+            innerOrbitPlaybackRate = nextInner
+            innerOrbitRateAppliedAt = now
+        }
+        applyOrbitPlaybackRates(force: force)
+    }
+
+    func ensureOrbitAnimations() {
+        guard orbitsEnabled, style.usesOrbitHighlights, bounds.width > 0, bounds.height > 0 else { return }
+        guard outerOrbitLayer.animation(forKey: "orbit") == nil ||
+                innerOrbitLayer.animation(forKey: "orbit") == nil else { return }
+        lastOrbitBounds = .null
+        updateOrbitPathsIfNeeded()
+        applyOrbitPlaybackRates(force: true)
     }
 
     var compositorDebugLines: [String] {
@@ -1636,7 +1750,14 @@ final class LimitRingView: NSView {
             "orbitContainerSpeed: \(orbitContainerLayer.speed)",
             "orbitContainerOpacity: \(orbitContainerLayer.opacity)",
             "outerOrbitPlaybackRate: \(outerOrbitPlaybackRate)",
-            "innerOrbitPlaybackRate: \(innerOrbitPlaybackRate)"
+            "innerOrbitPlaybackRate: \(innerOrbitPlaybackRate)",
+            "outerOrbitRateAge: \(formatOrbitRateAge(outerOrbitRateAppliedAt))",
+            "innerOrbitRateAge: \(formatOrbitRateAge(innerOrbitRateAppliedAt))",
+            "outerOrbitAnimationActive: \(outerOrbitLayer.animation(forKey: "orbit") != nil)",
+            "innerOrbitAnimationActive: \(innerOrbitLayer.animation(forKey: "orbit") != nil)",
+            "outerOrbitPhase: \(formatOrbitPhase(currentOrbitPhase(on: outerOrbitLayer)))",
+            "innerOrbitPhase: \(formatOrbitPhase(currentOrbitPhase(on: innerOrbitLayer)))",
+            "orbitAnimationInstallCount: \(orbitAnimationInstallCount)"
         ]
     }
 
@@ -1736,6 +1857,7 @@ final class LimitRingView: NSView {
     }
 
     private func installOrbitAnimation(on dot: CALayer, center: CGPoint, radius: CGFloat, duration: CFTimeInterval, clockwise: Bool, timeOffset: CFTimeInterval) {
+        let preservedPhase = currentOrbitPhase(on: dot) ?? 0.0
         dot.position = CGPoint(x: center.x, y: center.y - radius)
         let path = CGMutablePath()
         path.addArc(
@@ -1754,7 +1876,25 @@ final class LimitRingView: NSView {
         animation.rotationMode = nil
         animation.isRemovedOnCompletion = false
         animation.timeOffset = timeOffset
+        let localTime = dot.convertTime(CACurrentMediaTime(), from: nil)
+        animation.beginTime = OrbitAnimationPhase.beginTime(
+            localTime: localTime,
+            phase: preservedPhase,
+            duration: duration
+        )
         dot.add(animation, forKey: "orbit")
+        orbitAnimationInstallCount += 1
+    }
+
+    private func currentOrbitPhase(on dot: CALayer) -> CFTimeInterval? {
+        guard let animation = dot.animation(forKey: "orbit"), animation.duration > 0.0 else { return nil }
+        return OrbitAnimationPhase.current(
+            localTime: dot.convertTime(CACurrentMediaTime(), from: nil),
+            beginTime: animation.beginTime,
+            timeOffset: animation.timeOffset,
+            speed: animation.speed,
+            duration: animation.duration
+        )
     }
 
     private func applyOrbitPlaybackRates(force: Bool) {
@@ -1764,6 +1904,9 @@ final class LimitRingView: NSView {
 
     private func setPlaybackRate(_ rate: Float, on layer: CALayer, force: Bool) {
         guard force || abs(layer.speed - rate) >= 0.015 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        defer { CATransaction.commit() }
         let mediaTime = CACurrentMediaTime()
         let localTime = layer.convertTime(mediaTime, from: nil)
         layer.speed = rate
@@ -1771,6 +1914,16 @@ final class LimitRingView: NSView {
         layer.beginTime = 0.0
         let scaledTime = layer.convertTime(mediaTime, from: nil)
         layer.beginTime = (scaledTime - localTime) / CFTimeInterval(rate)
+    }
+
+    private func formatOrbitRateAge(_ appliedAt: CFTimeInterval?) -> String {
+        guard let appliedAt else { return "none" }
+        return String(format: "%.1fs", max(0.0, CACurrentMediaTime() - appliedAt))
+    }
+
+    private func formatOrbitPhase(_ phase: CFTimeInterval?) -> String {
+        guard let phase else { return "none" }
+        return String(format: "%.4f", phase)
     }
 
     private func updateOrbitStyle() {
@@ -1996,13 +2149,32 @@ final class LimitRingView: NSView {
 
     private func updateOrbitVisibility() {
         let orbitOpacity: Float = orbitsEnabled && style.usesOrbitHighlights ? 1.0 : 0.0
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
         orbitContainerLayer.opacity = orbitOpacity
-        orbitContainerLayer.speed = orbitOpacity > 0.0 ? 1.0 : 0.0
+        setLayerPaused(orbitContainerLayer, paused: orbitOpacity == 0.0)
 
         let dustOpacity: Float = pixelCloudEnabled ? 1.0 : 0.0
         dustContainerLayer.opacity = dustOpacity
-        dustContainerLayer.speed = dustOpacity > 0.0 ? 1.0 : 0.0
+        setLayerPaused(dustContainerLayer, paused: dustOpacity == 0.0)
+        CATransaction.commit()
         updateDynamicDust()
+        ensureOrbitAnimations()
+    }
+
+    private func setLayerPaused(_ layer: CALayer, paused: Bool) {
+        let mediaTime = CACurrentMediaTime()
+        if paused, layer.speed != 0.0 {
+            let localTime = layer.convertTime(mediaTime, from: nil)
+            layer.speed = 0.0
+            layer.timeOffset = localTime
+        } else if !paused, layer.speed == 0.0 {
+            let pausedTime = layer.timeOffset
+            layer.speed = 1.0
+            layer.timeOffset = 0.0
+            layer.beginTime = 0.0
+            layer.beginTime = layer.convertTime(mediaTime, from: nil) - pausedTime
+        }
     }
 
 }
@@ -2047,6 +2219,7 @@ final class LimitRingsApp: NSObject {
     private var lastPanelOrderWindowNumber: Int?
     private var lastOverlayWindowMatchRefreshAt: Date?
     private var lastGoodState: LimitState?
+    private var lastSuccessfulPetFrameAt: Date?
     private var isTrackingMouseDrag = false
     private var dragMouseToPetOriginOffsetAppKit: CGPoint?
     private var dragMouseToOverlayOriginOffsetAppKit: CGPoint?
@@ -2306,6 +2479,12 @@ final class LimitRingsApp: NSObject {
 
         let liveReference = preferLiveOverlay ? currentPetOverlayTopLeft : nil
         guard let petFrames = frameReader.readPetFramesTopLeft(preferLiveOverlay: preferLiveOverlay, liveReference: liveReference) else {
+            if currentPetFrameAppKit != nil,
+               let lastSuccessfulPetFrameAt,
+               Date().timeIntervalSince(lastSuccessfulPetFrameAt) < petFrameLossGraceInterval {
+                ringView.ensureOrbitAnimations()
+                return
+            }
             currentPetFrameAppKit = nil
             currentPetOverlayTopLeft = nil
             currentPetOverlayFrameAppKit = nil
@@ -2334,6 +2513,7 @@ final class LimitRingsApp: NSObject {
     }
 
     private func applyPetFrames(_ petFrames: PetFramesTopLeft) {
+        lastSuccessfulPetFrameAt = Date()
         let nextPetFrameAppKit = appKitRectFromTopLeft(
             petFrames.mascot,
             displayId: petFrames.displayId,
@@ -2372,6 +2552,7 @@ final class LimitRingsApp: NSObject {
         if petFrameChanged || displayChanged || ringView.orbitsEnabled != shouldEnableOrbitGlints || ringView.pixelCloudEnabled != shouldEnablePixelCloud {
             updateOrbitAnimationState()
         }
+        ringView.ensureOrbitAnimations()
     }
 
     private func setPanelFrame(forPetFrameTopLeft petFrame: CGRect, displayId: CGDirectDisplayID?, displayBounds: CGRect?) {
@@ -2412,11 +2593,27 @@ final class LimitRingsApp: NSObject {
     }
 
     private func applyPanelFrame(_ frame: CGRect) {
-        if let lastPanelFrame, framesAreClose(lastPanelFrame, frame) {
+        var stabilizedFrame = frame
+        if let lastPanelFrame,
+           abs(frame.width - lastPanelFrame.width) <= panelSizeHysteresis,
+           abs(frame.height - lastPanelFrame.height) <= panelSizeHysteresis {
+            stabilizedFrame.size = lastPanelFrame.size
+            let centerX = !isTrackingMouseDrag && abs(frame.midX - lastPanelFrame.midX) <= panelCenterHysteresis
+                ? lastPanelFrame.midX
+                : frame.midX
+            let centerY = !isTrackingMouseDrag && abs(frame.midY - lastPanelFrame.midY) <= panelCenterHysteresis
+                ? lastPanelFrame.midY
+                : frame.midY
+            stabilizedFrame.origin = CGPoint(
+                x: centerX - lastPanelFrame.width * 0.5,
+                y: centerY - lastPanelFrame.height * 0.5
+            )
+        }
+        if let lastPanelFrame, framesAreClose(lastPanelFrame, stabilizedFrame) {
             return
         }
-        lastPanelFrame = frame
-        panel.setFrame(frame, display: true)
+        lastPanelFrame = stabilizedFrame
+        panel.setFrame(stabilizedFrame, display: true)
     }
 
     private func framesAreClose(_ first: CGRect, _ second: CGRect) -> Bool {
@@ -2451,14 +2648,15 @@ final class LimitRingsApp: NSObject {
         ringView.pixelCloudEnabled = ringsVisible && pixelCloudEnabled && currentPetFrameAppKit != nil
     }
 
-    private func applyOrbitSpeedMode() {
+    private func applyOrbitSpeedMode(force: Bool = false) {
         switch orbitSpeedMode {
         case .calm:
-            ringView.setOrbitSpeedMultipliers(primary: 1.0, secondary: 1.0)
+            ringView.setOrbitSpeedMultipliers(primary: 1.0, secondary: 1.0, force: force)
         case .usageResponsive:
             ringView.setOrbitSpeedMultipliers(
                 primary: primaryOrbitSpeedMultiplier,
-                secondary: secondaryOrbitSpeedMultiplier
+                secondary: secondaryOrbitSpeedMultiplier,
+                force: force
             )
         }
     }
@@ -2824,7 +3022,7 @@ final class LimitRingsApp: NSObject {
         orbitSpeedMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: orbitSpeedModeDefaultsKey)
         updateOrbitSpeedModeMenuItems()
-        applyOrbitSpeedMode()
+        applyOrbitSpeedMode(force: true)
     }
 
     private func setRingStyle(_ style: RingStyle) {
@@ -3420,7 +3618,10 @@ guard let config = parseConfig() else {
 }
 
 if config.runSelfTests {
-    exit(PetFrameReader.runSyntheticStateTests() ? 0 : 1)
+    let passed = PetFrameReader.runSyntheticStateTests() &&
+        OrbitSpeedUpdatePolicy.runSyntheticTests() &&
+        OrbitAnimationPhase.runSyntheticTests()
+    exit(passed ? 0 : 1)
 }
 
 if config.previewPath != nil {
